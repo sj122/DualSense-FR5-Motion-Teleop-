@@ -1,6 +1,6 @@
 pydualsense
 numpy
 matplotlib
-vpython
+#vpython
 ahrs
 scipy
