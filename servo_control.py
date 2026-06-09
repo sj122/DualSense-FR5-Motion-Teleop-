@@ -316,7 +316,7 @@ def main() -> None:
                     smooth_rotation = rotation_filter.update(target_rotation)
                     smooth_position = position_filter.update(target_position)
 
-                    # 按照 20Hz 的频率下发给机械臂
+                    # 按照 sendhz频率下发给机械臂
                     if current_time - last_send_time >= SEND_INTERVAL:
                         command_euler = np.array(smooth_rotation.as_euler("xyz", degrees=True))
                         
