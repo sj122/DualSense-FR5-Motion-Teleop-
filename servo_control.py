@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -12,7 +13,7 @@ if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
 # 请确保 joy 库在你的环境里正常工作
-from joy import JoyShockDevice
+from joy import JoyShockDevice, add_ahrs_argument
 from fairino import Robot
 
 # ==========================================
@@ -29,6 +30,12 @@ SEND_INTERVAL = 1.0 / SEND_HZ
 # 低通滤波系数 (作用于位置和平滑，越小越平滑但延迟越大，1.0为无滤波)
 FILTER_ALPHA = 0.15
 L2_THRESHOLD = 0.2
+
+# 姿态解算算法 (也可用命令行 --ahrs 覆盖):
+#   "jsl"      JoyShockLibrary 内置融合 (原方案)
+#   "ekf"      航姿扩展卡尔曼滤波 EKF-AHRS (推荐)
+#   "madgwick" Madgwick 梯度下降滤波
+AHRS_ALGORITHM = "ekf"
 
 def init():
     home_pose_sim = (0, -90, 90, 0, 90, 0)
@@ -278,16 +285,16 @@ class RobotTeleopController:
 # ==========================================
 # 主程序循环
 # ==========================================
-def main() -> None:
+def main(ahrs: str = AHRS_ALGORITHM) -> None:
     print("=" * 50)
     print(" 机械臂遥操作节点启动 (平移积分 + 姿态映射 + 联合平滑)")
-    print(f" [配置] 读取频率: {READ_HZ}Hz | 下发频率: {SEND_HZ}Hz")
+    print(f" [配置] 读取频率: {READ_HZ}Hz | 下发频率: {SEND_HZ}Hz | 姿态解算: {ahrs}")
     print(" [按键] L1: 重新校准中心点 | L2: 踩下离合开始控制")
     print(" [摇杆] 左摇杆控制 XY，右摇杆上下控制 Z")
     print("=" * 50)
     print("正在连接手柄，请将其平放数秒完成底层校准...")
 
-    with JoyShockDevice() as device:
+    with JoyShockDevice(ahrs=ahrs) as device:
         device.connect_first_device(warmup_seconds=3.0)
         
         controller = RobotTeleopController(clutch_threshold=L2_THRESHOLD)
@@ -349,5 +356,8 @@ def main() -> None:
             print("\n\n已收到中断信号，遥操作节点安全关闭。")
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="DualSense 遥操作 Fairino 机械臂")
+    add_ahrs_argument(parser, default=AHRS_ALGORITHM)
+    args = parser.parse_args()
     init()
-    main()
+    main(ahrs=args.ahrs)

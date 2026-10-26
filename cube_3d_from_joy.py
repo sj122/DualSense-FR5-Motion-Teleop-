@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import sys
 import time
 from pathlib import Path
@@ -15,7 +16,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from joy import JoyShockDevice  # noqa: E402
+from joy import JoyShockDevice, add_ahrs_argument  # noqa: E402
 
 
 def rotation_from_quaternion_wxyz(quaternion_wxyz) -> R:
@@ -103,6 +104,10 @@ def configure_scene() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="用 VPython 正方体显示手柄姿态")
+    add_ahrs_argument(parser)
+    args = parser.parse_args()
+
     configure_scene()
 
     cube = box(
@@ -137,9 +142,10 @@ def main() -> None:
     print("正在连接手柄，请将其平放几秒钟完成底层校准...")
     print("按住 L2 才会把相对姿态增量映射到正方体。")
     print("按下 L1 会把当前手柄姿态设为新基准，但正方体不会跳变。")
+    print(f"姿态解算算法: {args.ahrs}")
     print("按 Ctrl+C 退出。\n")
 
-    with JoyShockDevice() as device:
+    with JoyShockDevice(ahrs=args.ahrs) as device:
         device.connect_first_device(warmup_seconds=3.0)
         last_caption_update = time.time()
         relative_controller = RelativeCubeOrientationController(clutch_threshold=0.2)
