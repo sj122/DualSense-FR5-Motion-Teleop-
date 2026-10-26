@@ -13,8 +13,10 @@
   分段生成，手持阶段叠加 8~12 Hz 生理震颤。
 - 手柄 IMU 以 250 Hz 出数，陀螺带白噪声 + 残余零偏 (JSL 自动标定后剩下的部分) + 零偏随机游走，
   加速度计带白噪声，并包含手的平移加速度。
-- JSL 内置算法按 250 Hz 逐帧运行 (与 DLL 内一致)；EKF / Madgwick 按 100 Hz 运行，
-  输入是 JslGetAndFlushAccumulatedGyro 式的平均角速度 + 最新加速度 (与 joy.py 实机读取方式一致)。
+- 三种算法都按 250 Hz 逐帧运行 (JSL 在 DLL 内，EKF / Madgwick 通过 joy.py 的 JslSetCallback 回调)，
+  按 100 Hz 采样输出。
+- 另外做一组 "剧烈乱晃后回到原位" 测试 (docs/ahrs_shake_test.png)，并对比旧版 joy.py
+  按 10 / 100 Hz 轮询平均角速度积分的效果。
 
 评价指标 (都在 "真实物理约定" 下计算，JSL 输出先做 pitch/roll 镜像还原，见 joy.py 说明)：
 
@@ -188,50 +190,146 @@ def simulate(seed: int, duration: float = DURATION) -> dict:
 # 运行各算法
 # ==========================================
 def run_filters(data: dict, ekf_kwargs: dict | None = None, madgwick_kwargs: dict | None = None) -> dict:
+    """三种算法都按设备帧 (250 Hz) 逐帧运行，与 joy.py 的回调模式一致；按 100 Hz 采样输出。"""
     t_dev, gyro_dev, accel_dev, t_app = data["t_dev"], data["gyro_dev"], data["accel_dev"], data["t_app"]
     dt_dev = t_dev[1] - t_dev[0]
-    n_app = len(t_app)
 
-    jsl = JSLGamepadMotion()
-    ekf = EKFAHRS(**(ekf_kwargs or {}))
-    mad = MadgwickAHRS(**(madgwick_kwargs or {}))
-    out = {name: np.zeros((n_app, 4)) for name in ALGORITHMS}
+    filters = {
+        "jsl": JSLGamepadMotion(),
+        "ekf": EKFAHRS(**(ekf_kwargs or {})),
+        "madgwick": MadgwickAHRS(**(madgwick_kwargs or {})),
+    }
+    out = {name: np.zeros((len(t_app), 4)) for name in ALGORITHMS}
     cost = {name: 0.0 for name in ALGORITHMS}
 
     j = 0
-    gyro_sum = np.zeros(3)
-    gyro_count = 0
-    last_app_time = None
     for k, ta in enumerate(t_app):
-        # 设备帧 -> JSL (250 Hz) + 累积陀螺
         while j < len(t_dev) and t_dev[j] <= ta + 1e-9:
-            if j > 0:
+            for name, filt in filters.items():
+                dt = 0.0 if j == 0 else dt_dev
+                if name == "jsl" and j == 0:
+                    continue
                 tic = time.perf_counter()
-                jsl.update(gyro_dev[j], accel_dev[j], dt_dev)
-                cost["jsl"] += time.perf_counter() - tic
-            gyro_sum += gyro_dev[j]
-            gyro_count += 1
+                filt.update(gyro_dev[j], accel_dev[j], dt)
+                cost[name] += time.perf_counter() - tic
             j += 1
-        out["jsl"][k] = jsl.quaternion_wxyz
+        for name, filt in filters.items():
+            out[name][k] = filt.quaternion_wxyz
 
-        # 应用层 100 Hz：平均角速度 + 最新加速度
-        gyro_avg = gyro_sum / max(gyro_count, 1)
-        gyro_sum[:] = 0.0
-        gyro_count = 0
-        accel = accel_dev[j - 1]
-        dt = 0.0 if last_app_time is None else ta - last_app_time
-        last_app_time = ta
-        for name, filt in (("ekf", ekf), ("madgwick", mad)):
-            tic = time.perf_counter()
-            out[name][k] = filt.update(gyro_avg, accel, dt)
-            cost[name] += time.perf_counter() - tic
-
-    cost_us = {
-        "jsl": cost["jsl"] / max(len(t_dev) - 1, 1) * 1e6,
-        "ekf": cost["ekf"] / n_app * 1e6,
-        "madgwick": cost["madgwick"] / n_app * 1e6,
-    }
+    cost_us = {name: cost[name] / max(j, 1) * 1e6 for name in ALGORITHMS}
     return {"quats": out, "cost_us": cost_us}
+
+
+# ==========================================
+# 剧烈乱晃后回到原位测试
+# ==========================================
+SHAKE_METHODS = [
+    ("jsl", 0, "JSL 内置\n(原方案)"),
+    ("ekf", 0, "EKF\n逐帧 250 Hz"),
+    ("madgwick", 0, "Madgwick\n逐帧 250 Hz"),
+    ("ekf", 100, "EKF 轮询 100 Hz\n(旧版 joy.py)"),
+    ("ekf", 10, "EKF 轮询 10 Hz\n(旧版立方体示例)"),
+]
+
+
+def simulate_shake(seed: int, peak_dps: float = 900.0) -> dict:
+    """手持 (抬头 15°) -> 2~8 s 三轴剧烈乱晃 (峰值约 900°/s，平移加速度约 0.8 g) -> 回到原位静止。
+
+    真值在 4 kHz 下生成，陀螺取 250 Hz 的瞬时角速度 (和真实 IMU 一样)，
+    数据到达时间带 0~6 ms 的蓝牙抖动，用于模拟轮询时每次拿到的帧数不固定。
+    """
+    rng = np.random.default_rng(seed)
+    fs = 4000
+    t = np.arange(0.0, 12.0, 1.0 / fs)
+    env = np.clip((t - 2.0) / 0.5, 0, 1) * np.clip((8.0 - t) / 0.5, 0, 1)
+    ang = np.zeros((len(t), 3))
+    for axis in range(3):
+        for _ in range(3):
+            f = rng.uniform(2.0, 5.0)
+            amp = peak_dps / (2 * np.pi * f) / 3 * rng.uniform(0.7, 1.3)
+            ang[:, axis] += amp * np.sin(2 * np.pi * f * (t - 2.0) + rng.uniform(0, 2 * np.pi))
+    ang = ang * env[:, None] + np.array([0.0, 15.0, 0.0])
+    rot = R.from_euler("YXZ", ang, degrees=True)
+    omega = np.degrees((rot[:-1].inv() * rot[1:]).as_rotvec()) * fs
+    omega = np.vstack([omega[:1], omega])
+
+    idx = np.arange(0, len(t), fs // DEVICE_HZ)
+    ts = t[idx]
+    gyro = omega[idx] + rng.uniform(-0.2, 0.2, 3) + rng.normal(0.0, 0.15, (len(idx), 3))
+    lin = np.zeros((len(idx), 3))
+    for axis in range(3):
+        lin[:, axis] = env[idx] * 0.8 * np.sin(2 * np.pi * rng.uniform(2.0, 5.0) * ts + rng.uniform(0, 2 * np.pi))
+    accel = rot[idx].inv().apply(lin + [0.0, 1.0, 0.0]) + rng.normal(0.0, 0.005, (len(idx), 3))
+    return {"t": ts, "arrive": ts + rng.uniform(0.0, 0.006, len(ts)), "gyro": gyro, "accel": accel,
+            "truth_ref": rot[int(1.5 * fs)], "truth_end": rot[-1]}
+
+
+def run_shake_method(data: dict, name: str, poll_hz: int, rng) -> tuple[np.ndarray, np.ndarray]:
+    """返回 (t=1.5 s 参考时刻的四元数, 结束时的四元数)。poll_hz=0 表示逐帧。"""
+    filt = {"jsl": JSLGamepadMotion, "ekf": EKFAHRS, "madgwick": MadgwickAHRS}[name]()
+    q_ref = None
+    if poll_hz == 0:
+        for k in range(len(data["t"])):
+            dt = 1.0 / DEVICE_HZ if (k > 0 or name == "jsl") else 0.0
+            q = filt.update(data["gyro"][k], data["accel"][k], dt)
+            if q_ref is None and data["t"][k] >= 1.5:
+                q_ref = q
+        return np.asarray(q_ref), np.asarray(q)
+
+    # 轮询：取上次轮询后到达的帧的平均角速度 × 墙钟间隔 (旧版 joy.py 的做法)
+    polls = np.arange(0.0, 12.0, 1.0 / poll_hz) + rng.uniform(0.0, 0.002, int(12 * poll_hz))
+    j, last, gyro_mean = 0, None, np.zeros(3)
+    for tp in polls:
+        start = j
+        while j < len(data["t"]) and data["arrive"][j] <= tp:
+            j += 1
+        if j > start:
+            gyro_mean = data["gyro"][start:j].mean(axis=0)
+        dt = 0.0 if last is None else tp - last
+        last = tp
+        q = filt.update(gyro_mean, data["accel"][max(j - 1, 0)], dt)
+        if q_ref is None and tp >= 1.5:
+            q_ref = q
+    return np.asarray(q_ref), np.asarray(q)
+
+
+def shake_test(runs: int, seed: int) -> dict:
+    errors = {label: [] for _, _, label in SHAKE_METHODS}
+    rng = np.random.default_rng(seed)
+    for r in range(runs):
+        data = simulate_shake(seed + r)
+        true_rel = data["truth_ref"].inv() * data["truth_end"]
+        for name, poll_hz, label in SHAKE_METHODS:
+            q_ref, q_end = run_shake_method(data, name, poll_hz, rng)
+            e = to_rotation(np.vstack([q_ref, q_end]), from_jsl=(name == "jsl"))
+            est_rel = e[0].inv() * e[1]
+            errors[label].append(float(np.degrees((true_rel.inv() * est_rel).magnitude())))
+    return {label: np.array(v) for label, v in errors.items()}
+
+
+def plot_shake(errors: dict, path: Path) -> None:
+    plt = setup_matplotlib()
+    fig, ax = plt.subplots(figsize=(10, 5))
+    labels = list(errors)
+    means = [errors[k].mean() for k in labels]
+    maxs = [errors[k].max() for k in labels]
+    colors = [COLORS[name] for name, _, _ in SHAKE_METHODS]
+    alphas = [1.0 if poll_hz == 0 else 0.45 for _, poll_hz, _ in SHAKE_METHODS]
+    x = np.arange(len(labels))
+    for i in range(len(labels)):
+        ax.bar(x[i], means[i], 0.6, color=colors[i], alpha=alphas[i])
+        ax.plot([x[i] - 0.15, x[i] + 0.15], [maxs[i]] * 2, color=INK_2, lw=1.5)
+        ax.annotate(f"均值 {means[i]:.1f}°\n最大 {maxs[i]:.1f}°", (x[i], maxs[i]), xytext=(0, 5),
+                    textcoords="offset points", ha="center", va="bottom", fontsize=8, color=INK)
+    ax.set_xticks(x, labels)
+    ax.set_ylabel("回到原位后的姿态误差 (°)")
+    ax.set_ylim(0, max(maxs) * 1.25)
+    ax.set_title(f"剧烈乱晃 6 s (峰值约 900°/s) 后回到原位的误差（{len(next(iter(errors.values())))} 次仿真，横线为最大值）",
+                 loc="left")
+    ax.grid(axis="x", visible=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
 
 
 def to_rotation(quats_wxyz: np.ndarray, from_jsl: bool) -> R:
@@ -405,7 +503,7 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
     bars = ax.barh([LABELS[n] for n in names], vals, color=[COLORS[n] for n in names], height=0.5)
     for rect, v in zip(bars, vals):
         ax.text(rect.get_width(), rect.get_y() + rect.get_height() / 2, f" {v:.0f} µs", va="center", fontsize=8, color=INK)
-    ax.set_title("单次更新耗时 (Python, 100 Hz 预算 10000 µs)", loc="left")
+    ax.set_title("单次更新耗时 (Python, 250 Hz 预算 4000 µs)", loc="left")
     ax.set_xlabel("µs / 次")
     ax.set_xlim(0, max(vals) * 1.35)
     ax.grid(axis="y", visible=False)
@@ -413,7 +511,7 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
 
     fig.text(0.01, 0.003,
              "仿真条件：IMU 250 Hz，陀螺噪声 0.15°/s + 残余零偏 ±0.3°/s + 零偏随机游走，加速度噪声 0.005 g；"
-             "EKF/Madgwick 以 100 Hz 运行 (与 joy.py 一致)，JSL 以 250 Hz 运行。"
+             "三种算法均按 250 Hz 逐帧运行 (与 joy.py 回调模式一致)。"
              "JSL 输出已做 pitch/roll 镜像还原后再评估；各算法航向在 t=3 s 对齐。",
              fontsize=8, color=INK_2)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -450,28 +548,36 @@ CSV_FIELDS = ["t", "dt", "gx", "gy", "gz", "ax", "ay", "az", "jsl_w", "jsl_x", "
 
 
 def record(seconds: float, out_path: Path) -> None:
+    """逐帧录制 IMU (DLL 回调，约 250 Hz)；JSL 四元数在主线程按 100 Hz 轮询，取最近一次的值。"""
     from joy import JoyShockDevice
 
     print("正在连接手柄，请先平放数秒...")
+    rows: list = []
+    jsl_quat = [(1.0, 0.0, 0.0, 0.0)]
+    start = time.perf_counter()
+
+    def on_sample(gyro, accel, dt):
+        if dt > 0.0:
+            rows.append([time.perf_counter() - start, dt, *gyro, *accel, *jsl_quat[0]])
+
     with JoyShockDevice(ahrs="jsl") as device:
         device.connect_first_device(warmup_seconds=3.0)
-        device.read_accumulated_gyro_dps()  # 清空预热期间累积的陀螺
-        print(f"开始录制 {seconds:.0f} 秒，请按 静置 -> 慢速转动 -> 快速甩动 -> 平移 -> 放下 的顺序操作手柄。")
-        last = time.perf_counter()
-        start = last
-        with open(out_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(CSV_FIELDS)
-            while time.perf_counter() - start < seconds:
-                time.sleep(max(0.0, 1.0 / APP_HZ - (time.perf_counter() - last)))
-                now = time.perf_counter()
-                gyro = device.read_accumulated_gyro_dps()
-                imu = device.read_imu_state()
-                motion = device.read_motion_state()
-                writer.writerow([now - start, now - last, *gyro, imu.accelX, imu.accelY, imu.accelZ,
-                                 motion.quatW, motion.quatX, motion.quatY, motion.quatZ])
-                last = now
-    print(f"已保存到 {out_path}")
+        if not device.callback_active:
+            raise RuntimeError("当前 JoyShockLibrary 不支持 JslSetCallback，无法逐帧录制。")
+        print(f"开始录制 {seconds:.0f} 秒，可以先缓慢转动，再剧烈乱晃，最后放回原位静置几秒。")
+        start = time.perf_counter()
+        device.imu_listeners.append(on_sample)
+        while time.perf_counter() - start < seconds:
+            m = device.read_motion_state()
+            jsl_quat[0] = (m.quatW, m.quatX, m.quatY, m.quatZ)
+            time.sleep(1.0 / APP_HZ)
+        device.imu_listeners.clear()
+
+    with open(out_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(CSV_FIELDS)
+        writer.writerows(rows)
+    print(f"已保存 {len(rows)} 帧到 {out_path}")
 
 
 def replay(csv_path: Path, fig_path: Path) -> None:
@@ -541,6 +647,14 @@ def main() -> None:
     print_table(mc if mc else {n: {k: (v, 0.0) for k, v in ev["metrics"][n].items()} for n in ALGORITHMS})
     plot_comparison(data, ev, mc, args.fig)
     print(f"\n对比图已保存到 {args.fig}")
+
+    shake = shake_test(max(args.runs // 2, 1), args.seed)
+    print("\n剧烈乱晃后回到原位的误差 (°):")
+    for label, v in shake.items():
+        print(f"  {label.replace(chr(10), ' '):24s} 均值 {v.mean():6.2f}  最大 {v.max():6.2f}")
+    shake_fig = args.fig.with_name("ahrs_shake_test.png")
+    plot_shake(shake, shake_fig)
+    print(f"乱晃测试图已保存到 {shake_fig}")
 
 
 if __name__ == "__main__":

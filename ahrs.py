@@ -185,8 +185,10 @@ class EKFAHRS(AHRSFilter):
     1. 预测用精确的四元数指数积分，状态转移雅可比包含 "四元数-零偏" 耦合项
        (参考代码里 A_12 = 0，零偏只能靠观测间接修正)。
     2. 过程噪声由陀螺噪声密度推导，并随 dt 缩放，读取频率变化时不需要重新调参。
-    3. 加速度观测噪声自适应：|a| 偏离 1g 越多 (手在加减速)，越不信任加速度计；
-       偏离过大时直接跳过本帧重力修正，避免平移加速度把姿态 "拽歪"。
+    3. 加速度观测噪声自适应：|a| 偏离 1g 越多、"晃动度" (加速度相对其平滑值的波动，
+       参考 JSL 的 Shakiness) 越大、角速度越快，越不信任加速度计；超过阈值直接跳过
+       本帧重力修正。剧烈乱晃时主要靠陀螺积分，避免平移/离心加速度把姿态 "拽歪"，
+       并通过协方差耦合把错误带进航向和零偏。
     4. 静止检测 + 零角速度修正 (ZARU)：手柄静止时把陀螺读数当作零偏的直接观测，
        使包括 Z 轴在内的三轴零偏都可观，显著降低无磁力计时的航向漂移。
     5. Joseph 形式协方差更新 + 对称化，数值更稳定。
@@ -201,10 +203,13 @@ class EKFAHRS(AHRSFilter):
         accel_noise_g: float = 0.03,        # 加速度方向观测噪声 (g)
         accel_adaptive_gain: float = 40.0,  # |a|-1 偏差对观测噪声的放大系数
         accel_reject_g: float = 0.25,       # |a| 偏离 1g 超过该值则跳过重力修正
+        shake_ref_g: float = 0.05,          # 晃动度对观测噪声的放大参考值
+        shake_reject_g: float = 0.3,        # 晃动度超过该值则跳过重力修正
+        gyro_reject_dps: float = 400.0,     # 角速度超过该值则跳过重力修正
         initial_bias_std_dps: float = 1.0,
         zaru: bool = True,
         still_gyro_dps: float = 2.0,        # 静止判定：角速度阈值
-        still_accel_g: float = 0.02,        # 静止判定：|a| 与平滑值的偏差阈值
+        still_accel_g: float = 0.04,        # 静止判定：晃动度阈值
         still_time_s: float = 0.4,          # 持续多久才认为静止
     ):
         super().__init__()
@@ -213,6 +218,9 @@ class EKFAHRS(AHRSFilter):
         self.sigma_a = accel_noise_g
         self.accel_adaptive_gain = accel_adaptive_gain
         self.accel_reject_g = accel_reject_g
+        self.shake_ref = shake_ref_g
+        self.shake_reject = shake_reject_g
+        self.gyro_reject = gyro_reject_dps * DEG2RAD
         self.initial_bias_std = initial_bias_std_dps * DEG2RAD
         self.zaru = zaru
         self.still_gyro = still_gyro_dps * DEG2RAD
@@ -226,6 +234,7 @@ class EKFAHRS(AHRSFilter):
         self.P = np.diag([1e-2] * 4 + [self.initial_bias_std ** 2] * 3)
         self._still_timer = 0.0
         self._smooth_accel: np.ndarray | None = None
+        self.shakiness = 0.0
         self.is_still = False
 
     @property
@@ -233,8 +242,10 @@ class EKFAHRS(AHRSFilter):
         return self.bias / DEG2RAD
 
     def _step(self, gyro: np.ndarray, accel: np.ndarray, dt: float) -> None:
-        self._predict(gyro, dt)
-        self._update_accel(accel)
+        dq = self._predict(gyro, dt)
+        self._track_shakiness(accel, dt, dq)
+        if np.linalg.norm(gyro) < self.gyro_reject and self.shakiness < self.shake_reject:
+            self._update_accel(accel)
         if self.zaru:
             self._update_stillness(gyro, accel, dt)
         self.q = quat_normalize(self.q)
@@ -257,6 +268,18 @@ class EKFAHRS(AHRSFilter):
 
         self.q = quat_normalize(quat_mul(q, dq))
         self.P = F @ self.P @ F.T + Q
+        return dq
+
+    def _track_shakiness(self, accel: np.ndarray, dt: float, dq: np.ndarray) -> None:
+        """晃动度：加速度偏离其平滑值的幅度，峰值保持并以 0.25 s 半衰期衰减。"""
+        if self._smooth_accel is None:
+            self._smooth_accel = accel.copy()
+        else:
+            # 平滑值跟随机体一起转动，单纯的转动不会被误判为晃动
+            self._smooth_accel = quat_rotate(quat_conj(dq), self._smooth_accel)
+        decay = 2.0 ** (-dt / 0.25)
+        self.shakiness = max(self.shakiness * decay, float(np.linalg.norm(accel - self._smooth_accel)))
+        self._smooth_accel = accel + (self._smooth_accel - accel) * decay
 
     def _measurement_update(self, residual: np.ndarray, H: np.ndarray, R: np.ndarray) -> None:
         P = self.P
@@ -292,18 +315,17 @@ class EKFAHRS(AHRSFilter):
             [x, w, zq, y],
             [w, -x, -y, zq],
         ])
-        sigma2 = self.sigma_a ** 2 * (1.0 + (self.accel_adaptive_gain * deviation) ** 2)
+        sigma2 = (
+            self.sigma_a ** 2
+            * (1.0 + (self.accel_adaptive_gain * deviation) ** 2)
+            * (1.0 + (self.shakiness / self.shake_ref) ** 2)
+        )
         self._measurement_update(z - h, H, np.eye(3) * sigma2)
 
     def _update_stillness(self, gyro: np.ndarray, accel: np.ndarray, dt: float) -> None:
-        if self._smooth_accel is None:
-            self._smooth_accel = accel.copy()
-        alpha = min(1.0, dt / 0.1)
-        self._smooth_accel += alpha * (accel - self._smooth_accel)
-
         still_now = (
             np.linalg.norm(gyro) < self.still_gyro
-            and np.linalg.norm(accel - self._smooth_accel) < self.still_accel
+            and self.shakiness < self.still_accel
             and abs(np.linalg.norm(accel) - 1.0) < 0.1
         )
         self._still_timer = self._still_timer + dt if still_now else 0.0

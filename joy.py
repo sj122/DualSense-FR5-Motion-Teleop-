@@ -4,6 +4,7 @@ import argparse
 import ctypes
 import math
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Iterator, Optional, Tuple
@@ -62,6 +63,13 @@ class JOY_SHOCK_STATE(ctypes.Structure):
     ]
 
 
+# JslSetCallback 回调：设备每上报一帧 (DualSense 约 250 Hz) 调用一次
+# (deviceId, 当前按键状态, 上一帧按键状态, 当前 IMU, 上一帧 IMU, 距上一帧的时间 s)
+JSL_CALLBACK = ctypes.CFUNCTYPE(
+    None, ctypes.c_int, JOY_SHOCK_STATE, JOY_SHOCK_STATE, IMU_STATE, IMU_STATE, ctypes.c_float
+)
+
+
 class DualSenseButtons:
     L1 = 0x00100
     R1 = 0x00200
@@ -84,6 +92,9 @@ def load_library(dll_path: Optional[str | Path] = None):
         float_ptr = ctypes.POINTER(ctypes.c_float)
         library.JslGetAndFlushAccumulatedGyro.argtypes = [ctypes.c_int, float_ptr, float_ptr, float_ptr]
         library.JslGetAndFlushAccumulatedGyro.restype = None
+    if hasattr(library, "JslSetCallback"):
+        library.JslSetCallback.argtypes = [JSL_CALLBACK]
+        library.JslSetCallback.restype = None
     return library
 
 
@@ -108,11 +119,15 @@ class JoyShockDevice:
     - ``"ekf"``      航姿扩展卡尔曼滤波，估计陀螺零偏，抗平移加速度干扰 (默认)
     - ``"madgwick"`` Madgwick 梯度下降滤波
 
-    ekf / madgwick 使用 JslGetAndFlushAccumulatedGyro 读取两次调用之间的平均角速度，
-    以调用间隔作为积分步长，所以 read_quaternion_* / read_euler_deg / read_input_frame
-    每调用一次就推进一步滤波，按固定频率 (例如 100 Hz) 调用即可。
+    ekf / madgwick 默认通过 JslSetCallback 在 DLL 的输入线程里逐帧 (约 250 Hz) 更新，
+    积分步长用手柄上报的帧间隔，和主循环读取频率无关 (立方体示例只有 10 Hz 也不受影响)。
+    剧烈晃动时如果按 10~100 Hz 用平均角速度积分，三轴转动的不可交换性和帧计数误差会
+    累积成几度到几十度的姿态误差，所以必须逐帧积分。
+    DLL 不支持回调或 imu_callback=False 时，退回到 JslGetAndFlushAccumulatedGyro 轮询。
+
     输出四元数与 JSL 内置四元数采用相同约定 (见 ahrs.jsl_convention)，
     切换算法后 servo_control.py 的 R_map 无需修改。
+    注意 JslSetCallback 是全局的，同一进程只应创建一个启用回调的 JoyShockDevice。
     """
 
     def __init__(
@@ -121,6 +136,7 @@ class JoyShockDevice:
         library=None,
         ahrs: str = DEFAULT_AHRS,
         ahrs_options: Optional[dict] = None,
+        imu_callback: bool = True,
     ):
         self.dll_path = Path(dll_path) if dll_path else resolve_default_dll_path()
         self._library = library
@@ -128,6 +144,12 @@ class JoyShockDevice:
         self.ahrs_name = ahrs.lower()
         self.ahrs_filter = create_ahrs(self.ahrs_name, **(ahrs_options or {}))
         self._last_ahrs_time: Optional[float] = None
+        self.imu_callback = imu_callback
+        self._callback = None
+        self._lock = threading.Lock()
+        self._latest_quat: Optional[Tuple[float, float, float, float]] = None
+        # 逐帧 IMU 监听器：fn(gyro_dps, accel_g, dt)，在 DLL 输入线程里调用 (录制数据用)
+        self.imu_listeners: list = []
 
     @property
     def library(self):
@@ -143,17 +165,57 @@ class JoyShockDevice:
         device_handles = (ctypes.c_int * 4)()
         self.library.JslGetConnectedDeviceHandles(device_handles, 4)
         self.device_id = int(device_handles[0])
+        self.reset_ahrs()
+        self._install_callback()
 
         if warmup_seconds > 0:
             time.sleep(warmup_seconds)
-        self.reset_ahrs()
+        if self.callback_active and self.ahrs_filter is not None:
+            # 等第一帧 IMU 到达，保证滤波器已经用重力完成初始对准
+            deadline = time.perf_counter() + 1.0
+            while self._latest_quat is None and time.perf_counter() < deadline:
+                time.sleep(0.005)
         return self.device_id
 
+    @property
+    def callback_active(self) -> bool:
+        return self._callback is not None
+
+    def _install_callback(self) -> None:
+        if not self.imu_callback or self._callback is not None or not hasattr(self.library, "JslSetCallback"):
+            return
+
+        def on_report(device_id, state, last_state, imu, last_imu, delta_time):
+            if device_id != self.device_id:
+                return
+            gyro = (imu.gyroX, imu.gyroY, imu.gyroZ)
+            accel = (imu.accelX, imu.accelY, imu.accelZ)
+            dt = float(delta_time)
+            if not 0.0 < dt < 0.1:  # 首帧或断线重连，只做重力对准不积分
+                dt = 0.0
+            if self.ahrs_filter is not None:
+                with self._lock:
+                    q = self.ahrs_filter.update(gyro, accel, dt)
+                    if self.ahrs_filter.initialized:
+                        self._latest_quat = tuple(float(v) for v in jsl_convention(q))
+            for listener in self.imu_listeners:
+                listener(gyro, accel, dt)
+
+        self._callback = JSL_CALLBACK(on_report)  # 必须保持引用，防止被垃圾回收
+        self.library.JslSetCallback(self._callback)
+
+    def _remove_callback(self) -> None:
+        if self._callback is not None:
+            self.library.JslSetCallback(JSL_CALLBACK())  # 空函数指针
+            self._callback = None
+
     def reset_ahrs(self) -> None:
-        """重新初始化姿态滤波器 (下一次读取时用当前加速度重新对准重力)。"""
-        if self.ahrs_filter is not None:
-            self.ahrs_filter.reset()
-        self._last_ahrs_time = None
+        """重新初始化姿态滤波器 (下一帧用当前加速度重新对准重力)。"""
+        with self._lock:
+            if self.ahrs_filter is not None:
+                self.ahrs_filter.reset()
+            self._last_ahrs_time = None
+            self._latest_quat = None
 
     def ensure_connected(self) -> int:
         if self.device_id is None:
@@ -202,6 +264,12 @@ class JoyShockDevice:
 
     def read_quaternion_wxyz(self) -> Tuple[float, float, float, float]:
         if self.ahrs_filter is not None:
+            if self.callback_active:
+                with self._lock:
+                    q = self._latest_quat
+                if q is not None:
+                    return q
+                return (1.0, 0.0, 0.0, 0.0)
             return self._update_ahrs()
         motion = self.read_motion_state()
         return (float(motion.quatW), float(motion.quatX), float(motion.quatY), float(motion.quatZ))
@@ -248,6 +316,7 @@ class JoyShockDevice:
 
     def close(self) -> None:
         if self._library is not None:
+            self._remove_callback()
             self._library.JslDisconnectAndDisposeAll()
         self.device_id = None
 
