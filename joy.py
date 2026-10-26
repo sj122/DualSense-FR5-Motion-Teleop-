@@ -15,7 +15,7 @@ if str(CURRENT_DIR) not in sys.path:
 
 from ahrs import AHRS_ALGORITHMS, create_ahrs, jsl_convention  # noqa: E402
 
-# 默认姿态解算算法：jsl (DLL 内置) / ekf (航姿卡尔曼滤波) / madgwick
+# 默认姿态解算算法：jsl / jsl_fixed / ekf / eskf / madgwick / mahony (见 ahrs.py)
 DEFAULT_AHRS = "ekf"
 
 
@@ -116,10 +116,13 @@ class JoyShockDevice:
     ahrs 参数选择姿态解算算法 (见 ahrs.py)：
 
     - ``"jsl"``      直接使用 DLL 内置融合输出的四元数 (原方案)
+    - ``"jsl_fixed"`` JSL 同一算法的 Python 移植，套用上游修复后的重力修正
     - ``"ekf"``      航姿扩展卡尔曼滤波，估计陀螺零偏，抗平移加速度干扰 (默认)
+    - ``"eskf"``     误差状态卡尔曼滤波 (ESKF / MEKF)，与 ekf 同样的噪声与门限设置
     - ``"madgwick"`` Madgwick 梯度下降滤波
+    - ``"mahony"``   Mahony 显式互补滤波 (PI 修正)
 
-    ekf / madgwick 默认通过 JslSetCallback 在 DLL 的输入线程里逐帧 (约 250 Hz) 更新，
+    除 jsl 外的算法默认通过 JslSetCallback 在 DLL 的输入线程里逐帧 (约 250 Hz) 更新，
     积分步长用手柄上报的帧间隔，和主循环读取频率无关 (立方体示例只有 10 Hz 也不受影响)。
     剧烈晃动时如果按 10~100 Hz 用平均角速度积分，三轴转动的不可交换性和帧计数误差会
     累积成几度到几十度的姿态误差，所以必须逐帧积分。
@@ -332,7 +335,10 @@ def add_ahrs_argument(parser: argparse.ArgumentParser, default: str = DEFAULT_AH
         "--ahrs",
         choices=AHRS_ALGORITHMS,
         default=default,
-        help="姿态解算算法: jsl=DLL 内置融合(原方案), ekf=航姿卡尔曼滤波, madgwick=Madgwick 滤波 (默认: %(default)s)",
+        help=(
+            "姿态解算算法: jsl=DLL 内置融合(原方案), jsl_fixed=JSL 上游修复版, ekf=扩展卡尔曼滤波, "
+            "eskf=误差状态卡尔曼滤波, madgwick=Madgwick 滤波, mahony=Mahony 互补滤波 (默认: %(default)s)"
+        ),
     )
 
 

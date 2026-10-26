@@ -32,9 +32,12 @@ FILTER_ALPHA = 0.15
 L2_THRESHOLD = 0.2
 
 # 姿态解算算法 (也可用命令行 --ahrs 覆盖):
-#   "jsl"      JoyShockLibrary 内置融合 (原方案)
-#   "ekf"      航姿扩展卡尔曼滤波 EKF-AHRS (推荐)
-#   "madgwick" Madgwick 梯度下降滤波
+#   "jsl"       JoyShockLibrary 内置融合 (原方案)
+#   "jsl_fixed" JSL 同一算法，套用上游修复后的重力修正
+#   "ekf"       航姿扩展卡尔曼滤波 EKF-AHRS (推荐)
+#   "eskf"      误差状态卡尔曼滤波 ESKF
+#   "madgwick"  Madgwick 梯度下降滤波
+#   "mahony"    Mahony 显式互补滤波
 AHRS_ALGORITHM = "ekf"
 
 def init():

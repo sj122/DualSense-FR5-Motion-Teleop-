@@ -1,4 +1,4 @@
-"""三种姿态解算算法对比：JSL 内置融合 / EKF-AHRS / Madgwick。
+"""姿态解算算法对比：JSL 内置融合 (原版 / 上游修复版) / EKF / ESKF / Madgwick / Mahony。
 
 用法：
 
@@ -13,8 +13,8 @@
   分段生成，手持阶段叠加 8~12 Hz 生理震颤。
 - 手柄 IMU 以 250 Hz 出数，陀螺带白噪声 + 残余零偏 (JSL 自动标定后剩下的部分) + 零偏随机游走，
   加速度计带白噪声，并包含手的平移加速度。
-- 三种算法都按 250 Hz 逐帧运行 (JSL 在 DLL 内，EKF / Madgwick 通过 joy.py 的 JslSetCallback 回调)，
-  按 100 Hz 采样输出。
+- 所有算法都按 250 Hz 逐帧运行 (JSL 在 DLL 内，其余通过 joy.py 的 JslSetCallback 回调)，
+  按 100 Hz 采样输出。JSL 原版用 Python 逐行移植的 GamepadMotion 代替 DLL。
 - 另外做一组 "剧烈乱晃后回到原位" 测试 (docs/ahrs_shake_test.png)，并对比旧版 joy.py
   按 10 / 100 Hz 轮询平均角速度积分的效果。
 
@@ -41,7 +41,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
 
-from ahrs import EKFAHRS, JSLGamepadMotion, MadgwickAHRS, jsl_convention  # noqa: E402
+from ahrs import JSLGamepadMotion, create_ahrs, jsl_convention  # noqa: E402
 
 DEVICE_HZ = 250
 APP_HZ = 100
@@ -49,20 +49,31 @@ DURATION = 60.0
 CLUTCH_TIME = 5.0      # 遥操作参考时刻 (模拟按下 L2)
 ALIGN_TIME = 3.0       # 航向对齐时刻 (各算法初始航向不同，只比较相对量)
 
-ALGORITHMS = ("jsl", "ekf", "madgwick")
+ALGORITHMS = ("jsl", "jsl_fixed", "ekf", "eskf", "madgwick", "mahony")
 LABELS = {
     "truth": "真值",
     "jsl": "JSL 内置 (原方案)",
-    "ekf": "EKF-AHRS (新)",
+    "jsl_fixed": "JSL 修复版",
+    "ekf": "EKF",
+    "eskf": "ESKF",
     "madgwick": "Madgwick",
+    "mahony": "Mahony",
 }
-# 分类色板 (前三个槽位在明/暗背景下都通过了色盲两两区分校验)
+# 分类色板：颜色跟随算法固定不变，6 个槽位通过了色盲相邻区分校验 (validate_palette.js)
 COLORS = {
     "jsl": "#2a78d6",
     "ekf": "#eb6834",
     "madgwick": "#1baf7a",
+    "mahony": "#eda100",
+    "eskf": "#e87ba4",
+    "jsl_fixed": "#008300",
     "truth": "#0b0b0b",
 }
+
+
+def make_filter(name: str):
+    """jsl 用 GamepadMotion 原版移植 (代替 DLL)，其余与 joy.py 中的实现相同。"""
+    return JSLGamepadMotion() if name == "jsl" else create_ahrs(name)
 INK = "#0b0b0b"
 INK_2 = "#52514e"
 GRID = "#e4e3df"
@@ -189,16 +200,12 @@ def simulate(seed: int, duration: float = DURATION) -> dict:
 # ==========================================
 # 运行各算法
 # ==========================================
-def run_filters(data: dict, ekf_kwargs: dict | None = None, madgwick_kwargs: dict | None = None) -> dict:
-    """三种算法都按设备帧 (250 Hz) 逐帧运行，与 joy.py 的回调模式一致；按 100 Hz 采样输出。"""
+def run_filters(data: dict) -> dict:
+    """所有算法都按设备帧 (250 Hz) 逐帧运行，与 joy.py 的回调模式一致；按 100 Hz 采样输出。"""
     t_dev, gyro_dev, accel_dev, t_app = data["t_dev"], data["gyro_dev"], data["accel_dev"], data["t_app"]
     dt_dev = t_dev[1] - t_dev[0]
 
-    filters = {
-        "jsl": JSLGamepadMotion(),
-        "ekf": EKFAHRS(**(ekf_kwargs or {})),
-        "madgwick": MadgwickAHRS(**(madgwick_kwargs or {})),
-    }
+    filters = {name: make_filter(name) for name in ALGORITHMS}
     out = {name: np.zeros((len(t_app), 4)) for name in ALGORITHMS}
     cost = {name: 0.0 for name in ALGORITHMS}
 
@@ -207,7 +214,7 @@ def run_filters(data: dict, ekf_kwargs: dict | None = None, madgwick_kwargs: dic
         while j < len(t_dev) and t_dev[j] <= ta + 1e-9:
             for name, filt in filters.items():
                 dt = 0.0 if j == 0 else dt_dev
-                if name == "jsl" and j == 0:
+                if name.startswith("jsl") and j == 0:
                     continue
                 tic = time.perf_counter()
                 filt.update(gyro_dev[j], accel_dev[j], dt)
@@ -225,8 +232,11 @@ def run_filters(data: dict, ekf_kwargs: dict | None = None, madgwick_kwargs: dic
 # ==========================================
 SHAKE_METHODS = [
     ("jsl", 0, "JSL 内置\n(原方案)"),
+    ("jsl_fixed", 0, "JSL 修复版\n逐帧 250 Hz"),
     ("ekf", 0, "EKF\n逐帧 250 Hz"),
+    ("eskf", 0, "ESKF\n逐帧 250 Hz"),
     ("madgwick", 0, "Madgwick\n逐帧 250 Hz"),
+    ("mahony", 0, "Mahony\n逐帧 250 Hz"),
     ("ekf", 100, "EKF 轮询 100 Hz\n(旧版 joy.py)"),
     ("ekf", 10, "EKF 轮询 10 Hz\n(旧版立方体示例)"),
 ]
@@ -266,11 +276,11 @@ def simulate_shake(seed: int, peak_dps: float = 900.0) -> dict:
 
 def run_shake_method(data: dict, name: str, poll_hz: int, rng) -> tuple[np.ndarray, np.ndarray]:
     """返回 (t=1.5 s 参考时刻的四元数, 结束时的四元数)。poll_hz=0 表示逐帧。"""
-    filt = {"jsl": JSLGamepadMotion, "ekf": EKFAHRS, "madgwick": MadgwickAHRS}[name]()
+    filt = make_filter(name)
     q_ref = None
     if poll_hz == 0:
         for k in range(len(data["t"])):
-            dt = 1.0 / DEVICE_HZ if (k > 0 or name == "jsl") else 0.0
+            dt = 1.0 / DEVICE_HZ if (k > 0 or name.startswith("jsl")) else 0.0
             q = filt.update(data["gyro"][k], data["accel"][k], dt)
             if q_ref is None and data["t"][k] >= 1.5:
                 q_ref = q
@@ -309,7 +319,7 @@ def shake_test(runs: int, seed: int) -> dict:
 
 def plot_shake(errors: dict, path: Path) -> None:
     plt = setup_matplotlib()
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(14, 5.5))
     labels = list(errors)
     means = [errors[k].mean() for k in labels]
     maxs = [errors[k].max() for k in labels]
@@ -431,7 +441,7 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
     fig = plt.figure(figsize=(15, 13.5))
     gs = GridSpec(4, 3, figure=fig, height_ratios=[1.0, 1.0, 1.0, 1.1], hspace=0.6, wspace=0.25,
                   top=0.92, bottom=0.06)
-    fig.suptitle("DualSense 姿态解算算法对比：JSL 内置融合 vs EKF-AHRS vs Madgwick",
+    fig.suptitle("DualSense 姿态解算算法对比：JSL 原版 / JSL 修复版 / EKF / ESKF / Madgwick / Mahony",
                  fontsize=15, fontweight="bold", color=INK, y=0.985)
 
     # 第 1 行：roll / pitch / yaw 曲线 (真实物理约定)
@@ -440,7 +450,7 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
         _shade_segments(ax)
         for name in ALGORITHMS:
             e = ev["series"][name]["rot"].as_euler("YXZ", degrees=True)[:, idx]
-            ax.plot(t, e, color=COLORS[name], lw=1.4, label=LABELS[name])
+            ax.plot(t, e, color=COLORS[name], lw=1.1, label=LABELS[name])
         ax.plot(t, truth_euler[:, idx], color=COLORS["truth"], lw=1.2, ls="--", label=LABELS["truth"])
         ax.set_title(title, loc="left")
         ax.set_xlabel("时间 (s)")
@@ -448,7 +458,7 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
         ax.set_xlim(t[0], t[-1])
         if col == 0:
             handles, labels = ax.get_legend_handles_labels()
-            fig.legend(handles, labels, loc="upper center", ncol=4, bbox_to_anchor=(0.5, 0.965), fontsize=10)
+            fig.legend(handles, labels, loc="upper center", ncol=len(labels), bbox_to_anchor=(0.5, 0.965), fontsize=10)
 
     # 第 2 行：倾角误差
     ax = fig.add_subplot(gs[1, :])
@@ -480,27 +490,32 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
     stats = mc if mc is not None else {n: {k: (v, 0.0) for k, v in ev["metrics"][n].items()} for n in ALGORITHMS}
     groups = [("tilt_rmse", "倾角 RMSE"), ("tilt_max", "倾角最大误差"), ("rel_rmse", "相对姿态 RMSE"), ("rel_final", "60 s 末航向漂移")]
     ax = fig.add_subplot(gs[3, :2])
-    width = 0.26
+    width = 0.8 / len(ALGORITHMS)
     x = np.arange(len(groups))
+    top = 0.0
     for i, name in enumerate(ALGORITHMS):
         means = [stats[name][key][0] for key, _ in groups]
         stds = [stats[name][key][1] for key, _ in groups]
-        bars = ax.bar(x + (i - 1) * width, means, width * 0.92, yerr=stds if mc else None,
+        offset = (i - (len(ALGORITHMS) - 1) / 2) * width
+        bars = ax.bar(x + offset, means, width * 0.9, yerr=stds if mc else None,
                       color=COLORS[name], label=LABELS[name], error_kw={"ecolor": INK_2, "lw": 1, "capsize": 2})
         for rect, m, sd in zip(bars, means, stds):
-            ax.text(rect.get_x() + rect.get_width() / 2, m + (sd if mc else 0.0), f"{m:.2f}",
-                    ha="center", va="bottom", fontsize=7, color=INK)
+            y = m + (sd if mc else 0.0)
+            top = max(top, y)
+            ax.annotate(f"{m:.2f}", (rect.get_x() + rect.get_width() / 2, y), xytext=(0, 2),
+                        textcoords="offset points", ha="center", va="bottom", fontsize=6.5, color=INK, rotation=90)
+    ax.set_ylim(0, top * 1.25)
     ax.set_xticks(x, [g[1] for g in groups])
     ax.set_ylabel("误差 (°)")
     runs_note = f"（{mc['_runs']} 次蒙特卡洛平均 ± 标准差）" if mc else ""
     ax.set_title(f"误差统计{runs_note}", loc="left")
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper right", ncol=2)
     ax.grid(axis="x", visible=False)
 
     ax = fig.add_subplot(gs[3, 2])
-    names = ["ekf", "madgwick"]
+    names = [n for n in ALGORITHMS if n != "jsl"]
     vals = [stats[n]["cost_us"][0] for n in names]
-    bars = ax.barh([LABELS[n] for n in names], vals, color=[COLORS[n] for n in names], height=0.5)
+    bars = ax.barh([LABELS[n] for n in names], vals, color=[COLORS[n] for n in names], height=0.6)
     for rect, v in zip(bars, vals):
         ax.text(rect.get_width(), rect.get_y() + rect.get_height() / 2, f" {v:.0f} µs", va="center", fontsize=8, color=INK)
     ax.set_title("单次更新耗时 (Python, 250 Hz 预算 4000 µs)", loc="left")
@@ -511,8 +526,8 @@ def plot_comparison(data: dict, ev: dict, mc: dict | None, path: Path) -> None:
 
     fig.text(0.01, 0.003,
              "仿真条件：IMU 250 Hz，陀螺噪声 0.15°/s + 残余零偏 ±0.3°/s + 零偏随机游走，加速度噪声 0.005 g；"
-             "三种算法均按 250 Hz 逐帧运行 (与 joy.py 回调模式一致)。"
-             "JSL 输出已做 pitch/roll 镜像还原后再评估；各算法航向在 t=3 s 对齐。",
+             "所有算法均按 250 Hz 逐帧运行 (与 joy.py 回调模式一致)。"
+             "JSL 原版输出已做 pitch/roll 镜像还原后再评估；各算法航向在 t=3 s 对齐。",
              fontsize=8, color=INK_2)
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130, bbox_inches="tight")
@@ -523,7 +538,7 @@ def plot_recorded(rows: dict, path: Path) -> None:
     plt = setup_matplotlib()
     t = rows["t"] - rows["t"][0]
     fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
-    fig.suptitle("真实手柄数据回放：三种算法姿态对比 (无真值)", fontsize=14, fontweight="bold", color=INK)
+    fig.suptitle("真实手柄数据回放：各算法姿态对比 (无真值)", fontsize=14, fontweight="bold", color=INK)
     rots = {name: to_rotation(rows[name], from_jsl=(name == "jsl")) for name in ALGORITHMS}
     k = int(np.searchsorted(t, min(ALIGN_TIME, t[-1])))
     ref = rots["ekf"]
@@ -534,7 +549,7 @@ def plot_recorded(rows: dict, path: Path) -> None:
             ax.plot(t, rots[name].as_euler("YXZ", degrees=True)[:, idx], color=COLORS[name], lw=1.3, label=LABELS[name])
         ax.set_title(title, loc="left")
         ax.set_ylabel("角度 (°)")
-    axes[0].legend(loc="upper left", ncol=3)
+    axes[0].legend(loc="upper left", ncol=len(ALGORITHMS))
     axes[-1].set_xlabel("时间 (s)")
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=130, bbox_inches="tight")
@@ -582,17 +597,19 @@ def record(seconds: float, out_path: Path) -> None:
 
 def replay(csv_path: Path, fig_path: Path) -> None:
     data = np.genfromtxt(csv_path, delimiter=",", names=True)
-    ekf, mad = EKFAHRS(), MadgwickAHRS()
-    rows = {"t": data["t"], "jsl": np.column_stack([data["jsl_w"], data["jsl_x"], data["jsl_y"], data["jsl_z"]]),
-            "ekf": np.zeros((len(data), 4)), "madgwick": np.zeros((len(data), 4))}
+    # jsl 用录制时 DLL 输出的四元数，其余算法用录制的 IMU 数据离线重跑
+    filters = {name: create_ahrs(name) for name in ALGORITHMS if name != "jsl"}
+    rows = {"t": data["t"], "jsl": np.column_stack([data["jsl_w"], data["jsl_x"], data["jsl_y"], data["jsl_z"]])}
+    rows.update({name: np.zeros((len(data), 4)) for name in filters})
     for i, row in enumerate(data):
         gyro = (row["gx"], row["gy"], row["gz"])
         accel = (row["ax"], row["ay"], row["az"])
         dt = 0.0 if i == 0 else row["dt"]
-        rows["ekf"][i] = ekf.update(gyro, accel, dt)
-        rows["madgwick"][i] = mad.update(gyro, accel, dt)
+        for name, filt in filters.items():
+            rows[name][i] = filt.update(gyro, accel, dt)
     plot_recorded(rows, fig_path)
-    print(f"EKF 估计的陀螺残余零偏 (deg/s): {np.round(ekf.gyro_bias_dps, 3)}")
+    for name in ("ekf", "eskf", "mahony"):
+        print(f"{LABELS[name]} 估计的陀螺残余零偏 (deg/s): {np.round(filters[name].gyro_bias_dps, 3)}")
     print(f"图已保存到 {fig_path}")
 
 
@@ -625,7 +642,7 @@ def print_table(stats: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="JSL / EKF / Madgwick 姿态解算对比")
+    parser = argparse.ArgumentParser(description="JSL / EKF / ESKF / Madgwick / Mahony 姿态解算对比")
     parser.add_argument("--runs", type=int, default=20, help="蒙特卡洛仿真次数")
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--fig", type=Path, default=CURRENT_DIR / "docs" / "ahrs_comparison.png")
