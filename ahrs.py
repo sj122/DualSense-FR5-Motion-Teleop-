@@ -197,6 +197,10 @@ class _GravityAidedKalman(AHRSFilter):
     """EKF 与 ESKF 共用的噪声参数、晃动度、加速度门限和静止检测。
 
     两者只在状态表示和线性化方式上不同，其余处理完全一致，便于公平对比。
+
+    初始姿态协方差要取小 (默认 1°)：没有磁力计时航向不可观，过大的初始方差不会被观测
+    收敛，随机体转动混入机体系各轴后，会通过互协方差让重力修正 "漏" 进航向。仿真中把
+    初始方差放到约 11° 时，ESKF 的遥操作相对姿态误差会从 0.4° 恶化到约 3°。
     子类实现 _reset_covariance / _predict / _update_accel / _update_zaru。
     """
 
@@ -210,6 +214,7 @@ class _GravityAidedKalman(AHRSFilter):
         shake_ref_g: float = 0.05,          # 晃动度对观测噪声的放大参考值
         shake_reject_g: float = 0.3,        # 晃动度超过该值则跳过重力修正
         gyro_reject_dps: float = 400.0,     # 角速度超过该值则跳过重力修正
+        initial_attitude_std_deg: float = 1.0,  # 初始姿态不确定度 (加速度对准后的倾角误差，航向按定义为 0)
         initial_bias_std_dps: float = 1.0,
         zaru: bool = True,
         still_gyro_dps: float = 2.0,        # 静止判定：角速度阈值
@@ -225,6 +230,7 @@ class _GravityAidedKalman(AHRSFilter):
         self.shake_ref = shake_ref_g
         self.shake_reject = shake_reject_g
         self.gyro_reject = gyro_reject_dps * DEG2RAD
+        self.initial_attitude_std = initial_attitude_std_deg * DEG2RAD
         self.initial_bias_std = initial_bias_std_dps * DEG2RAD
         self.zaru = zaru
         self.still_gyro = still_gyro_dps * DEG2RAD
@@ -323,7 +329,8 @@ class EKFAHRS(_GravityAidedKalman):
     name = "ekf"
 
     def _reset_covariance(self) -> None:
-        self.P = np.diag([1e-2] * 4 + [self.initial_bias_std ** 2] * 3)
+        # 小角度下四元数虚部 ≈ 误差角 / 2
+        self.P = np.diag([(0.5 * self.initial_attitude_std) ** 2] * 4 + [self.initial_bias_std ** 2] * 3)
 
     def _predict(self, gyro: np.ndarray, dt: float) -> np.ndarray:
         q = self.q
@@ -395,7 +402,7 @@ class ESKFAHRS(_GravityAidedKalman):
     name = "eskf"
 
     def _reset_covariance(self) -> None:
-        self.P = np.diag([0.2 ** 2] * 3 + [self.initial_bias_std ** 2] * 3)
+        self.P = np.diag([self.initial_attitude_std ** 2] * 3 + [self.initial_bias_std ** 2] * 3)
 
     def _predict(self, gyro: np.ndarray, dt: float) -> np.ndarray:
         omega = gyro - self.bias
